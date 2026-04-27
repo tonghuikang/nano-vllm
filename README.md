@@ -60,7 +60,11 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
-### Reproduction on NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory) — 2026-04-27
+---
+
+## Reproduction on NVIDIA DGX Spark
+
+Hardware: GB10, sm_121, 128 GB unified memory.
 
 `bench.py` headline run, same workload as above (256 seqs, in/out 100–1024 tok,
 Qwen3-0.6B, `enforce_eager=False`). Benched in-process via the `LLM.generate`
@@ -70,7 +74,7 @@ batched API.
 |------------------|--------------:|---------:|----------------------:|
 | Nano-vLLM (Spark) | 133,966 | 71.27 | **1879.61** |
 
-#### Prefix-length × concurrency sweep — Nano-vLLM vs vLLM, same hardware
+### Prefix-length × concurrency sweep — Nano-vLLM vs vLLM, same hardware
 
 Same harness as `~/Desktop/setup/spark/bench_vllm.py`: each `(N, prefix_tokens)`
 cell sends N requests sharing one random prefix, `output_tokens =
@@ -116,8 +120,3 @@ vLLM. The gap opens up specifically on shared-prefix cells with concurrency
 [`bench/`](bench/) (`bench_concurrency.py` for nano-vllm in-process,
 `bench_vllm.py` for the vLLM HTTP path, `probe_nanovllm.py` for the
 focused diagnostic experiments).
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
