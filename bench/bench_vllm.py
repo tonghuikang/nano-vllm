@@ -1,46 +1,42 @@
 #!/usr/bin/env python3
-"""Throughput sweep: concurrency x prefix length, in tokens.
+"""Throughput sweep against vLLM's /v1/completions endpoint.
 
-Talks to vLLM's /v1/completions endpoint with `prompt` as a list of integer
-token IDs (vLLM accepts that directly), so we don't need a tokenizer or any
-text calibration.
+Mirror of `bench_concurrency.py` but pointed at vLLM's HTTP server. Each
+(N, prefix_tokens) cell sends N concurrent requests sharing one random
+prefix; vLLM's prefix cache absorbs the prefill cost after the first
+request and the cell measures decode throughput at concurrency N.
 
-Each (N, prefix_tokens) cell sends N concurrent requests that all share the
-same random prefix of `prefix_tokens` token IDs — i.e. shared-context
-workload (long system prompt / document), where vLLM's prefix cache absorbs
-the prefill cost after the first request and the cell measures decode
-throughput at concurrency N.
-
-Generation length is sampled per-request uniformly in
-[OUTPUT_TOKENS_MIN, OUTPUT_TOKENS_MAX], pinned via min_tokens=max_tokens and
-ignore_eos=True so the model emits exactly that many tokens regardless of
-content. Prompts/completions are gibberish — only throughput matters.
-
-A single warmup pass (8 concurrent, 64-token shared prefix, 16 output
-tokens) runs once at the start, before any timed cell.
+Output length is pinned via `min_tokens=max_tokens` and `ignore_eos=True`
+so each request emits exactly `clamp(131072/N, 64, 1024)` tokens. The
+last column reports cold-cache prefill wall time at each prefix length
+— matches `~/Desktop/setup/spark/bench_prefill.py` folded into the same
+table.
 """
-import json, time, urllib.request, concurrent.futures as cf, random, sys, threading, os
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import random
+import sys
+import threading
+import time
+import urllib.request
 
-# Default thread stack is 8 MB; with 1024 threads that's 8 GB of virtual
-# memory, enough to draw OOM-killer attention on a box where vLLM owns most
-# of the unified memory. 512 KB is plenty for a thread that just does a
-# urllib.urlopen.
+# Default thread stack is 8 MB; 1024 threads × 8 MB = 8 GB of VM, enough to
+# draw OOM-killer attention on a box where vLLM owns most of the unified
+# memory. 512 KB is plenty for a thread that just does a urlopen.
 threading.stack_size(512 * 1024)
 
-URL = "http://localhost:8000/v1/completions"   # bypass Cloudflare's 100s edge timeout
-MODEL = "Qwen/Qwen3-0.6B"
-API_KEY = os.environ.get("VLLM_API_KEY", "")
+URL_DEFAULT = "http://localhost:8000/v1/completions"
+MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
 
 OUTPUT_TOKENS_MIN = 64
 OUTPUT_TOKENS_MAX = 1024
-GEN_BUDGET_PER_CELL = 128 * 1024   # 131 072 total output tokens per cell
+GEN_BUDGET_PER_CELL = 128 * 1024  # 131 072 total output tokens per cell
 
-PREFIX_LENGTHS = [1, 4096, 32768]
-CONCURRENCIES = [1, 4, 16, 64, 256, 1024]
+PREFIX_LENGTHS_DEFAULT = [1, 4096, 32768]
+CONCURRENCIES_DEFAULT = [1, 4, 16, 64, 256, 1024]
 
-# gpt-oss uses the o200k_harmony tokenizer (~201k vocab). We pick from a
-# middle range to dodge specials and reserved IDs. Using a small range is
-# fine — vLLM still has to attend over the whole prefix.
 TOK_LO, TOK_HI = 1000, 100_000
 
 
@@ -49,21 +45,21 @@ def random_token_ids(n_tokens, seed):
     return [rng.randint(TOK_LO, TOK_HI) for _ in range(n_tokens)]
 
 
-def one(prompt_ids, output_tokens):
+def one(url, model, prompt_ids, output_tokens, api_key):
     body = json.dumps({
-        "model": MODEL,
+        "model": model,
         "prompt": prompt_ids,
         "max_tokens": output_tokens,
-        "min_tokens": output_tokens,   # vLLM extension
-        "ignore_eos": True,            # vLLM extension
+        "min_tokens": output_tokens,
+        "ignore_eos": True,
         "temperature": 0.0,
         "stop": [],
     }).encode()
-    t0 = time.perf_counter()
     headers = {"Content-Type": "application/json", "User-Agent": "curl/8.5.0"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    req = urllib.request.Request(URL, data=body, headers=headers)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=body, headers=headers)
+    t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=600) as r:
         data = json.loads(r.read())
     dt = time.perf_counter() - t0
@@ -71,30 +67,17 @@ def one(prompt_ids, output_tokens):
     return dt, u["prompt_tokens"], u["completion_tokens"]
 
 
-def plan_requests(N, prefix_tokens, seed_base):
-    """Return list of (prompt_ids, output_tokens) for one cell.
+def output_tokens_for(N):
+    return max(OUTPUT_TOKENS_MIN, min(OUTPUT_TOKENS_MAX, GEN_BUDGET_PER_CELL // N))
 
-    All N requests share the same prefix (one prefix per prefix-length).
-    This lets vLLM's prefix cache absorb the prefill cost after the first
-    request — appropriate for shared-context workloads (long system prompt,
-    shared document, …).
 
-    Each request asks for exactly the same output length:
-        output_tokens = clamp(GEN_BUDGET_PER_CELL // N, MIN, MAX).
-    So the total generation per cell is GEN_BUDGET_PER_CELL split evenly
-    among the N requests, clipped to [MIN, MAX] per request when N is
-    extreme.
-    """
+def sweep_cell(url, model, N, prefix_tokens, seed_base, api_key):
     shared_prefix = random_token_ids(prefix_tokens, seed=seed_base)
-    out_tok = max(OUTPUT_TOKENS_MIN, min(OUTPUT_TOKENS_MAX, GEN_BUDGET_PER_CELL // N))
-    return [(shared_prefix, out_tok) for _ in range(N)]
-
-
-def sweep_cell(N, prefix_tokens, seed_base):
-    plan = plan_requests(N, prefix_tokens, seed_base)
+    out_tok = output_tokens_for(N)
+    plan = [(shared_prefix, out_tok) for _ in range(N)]
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=N) as ex:
-        futs = [ex.submit(one, p, k) for (p, k) in plan]
+        futs = [ex.submit(one, url, model, p, k, api_key) for (p, k) in plan]
         results = [f.result() for f in cf.as_completed(futs)]
     wall = time.perf_counter() - t0
     c_tok = sum(r[2] for r in results)
@@ -102,41 +85,70 @@ def sweep_cell(N, prefix_tokens, seed_base):
     return c_tok / wall, len(plan), p_tok, c_tok, wall
 
 
-def warmup():
-    """One short pass to settle engine state before any timed cell.
+def cold_prefill(url, model, prefix_tokens, seed, api_key):
+    """Single cold-cache request asking for one decode step. Wall time
+    ≈ prefill (one decode is tens of ms — rounding error against any
+    non-trivial prefill)."""
+    prompt = random_token_ids(prefix_tokens, seed=seed)
+    dt, _, _ = one(url, model, prompt, output_tokens=1, api_key=api_key)
+    return dt
 
-    16-token output, single shared 64-token prefix replicated across the
-    warmup batch.
-    """
-    Nw = min(8, max(CONCURRENCIES))
+
+def warmup(url, model, api_key, max_concurrency):
+    Nw = min(8, max_concurrency)
     shared_prefix = random_token_ids(64, seed=99_000)
-    prompts = [(shared_prefix, 16) for _ in range(Nw)]
+    plan = [(shared_prefix, 16) for _ in range(Nw)]
     with cf.ThreadPoolExecutor(max_workers=Nw) as ex:
-        list(ex.map(lambda pk: one(pk[0], pk[1]), prompts))
-    print(f"#   warmup done", file=sys.stderr)
+        list(ex.map(lambda pk: one(url, model, pk[0], pk[1], api_key), plan))
+    print("#   warmup done", file=sys.stderr)
+
+
+def parse_int_list(s):
+    return [int(x) for x in s.split(",") if x.strip()]
 
 
 if __name__ == "__main__":
-    print(f"# Config: output_tokens~U[{OUTPUT_TOKENS_MIN},{OUTPUT_TOKENS_MAX}], "
-          f"shared prefix per cell",
-          file=sys.stderr)
-    print("# Warming up engine…", file=sys.stderr)
-    warmup()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default=URL_DEFAULT)
+    ap.add_argument("--model", default=os.environ.get("BENCH_MODEL", MODEL_DEFAULT))
+    ap.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", ""))
+    ap.add_argument("--prefix-lengths", type=parse_int_list, default=PREFIX_LENGTHS_DEFAULT)
+    ap.add_argument("--concurrencies", type=parse_int_list, default=CONCURRENCIES_DEFAULT)
+    args = ap.parse_args()
 
-    header = "prefix \\ concurrency  | " + " | ".join(f"{N:>6d}" for N in CONCURRENCIES)
+    print(
+        f"# url={args.url} model={args.model} prefixes={args.prefix_lengths} "
+        f"concurrencies={args.concurrencies}",
+        file=sys.stderr,
+    )
+    print("# Warming up engine…", file=sys.stderr)
+    warmup(args.url, args.model, args.api_key, max(args.concurrencies))
+
+    header = (
+        "prefix \\ N            | "
+        + " | ".join(f"{N:>5d}" for N in args.concurrencies)
+        + " | prefill (s)"
+    )
     print(header)
     print("-" * len(header))
 
-    diagnostics = []
     seed_base = 1
-    for L in PREFIX_LENGTHS:
-        row = [f"{L:>20d}"]
-        for N in CONCURRENCIES:
-            tps, n_req, p_tok, c_tok, wall = sweep_cell(N, L, seed_base)
-            seed_base += n_req + 7
-            diagnostics.append((L, N, n_req, p_tok, c_tok, wall, tps))
-            row.append(f"{tps:>6.0f}")
-            print(f"#   L={L:>5} N={N:>3}: {n_req:>4} reqs, "
-                  f"p={p_tok:>8d}, c={c_tok:>7d}, wall={wall:>6.1f}s, "
-                  f"out_tps={tps:>6.1f}", file=sys.stderr)
-        print("  | ".join(row))
+    for L in args.prefix_lengths:
+        prefill_s = cold_prefill(args.url, args.model, L, seed=seed_base + 50_000, api_key=args.api_key)
+        row = [f"{L:>22d}"]
+        for N in args.concurrencies:
+            try:
+                tps, n_req, p_tok, c_tok, wall = sweep_cell(
+                    args.url, args.model, N, L, seed_base, args.api_key
+                )
+                row.append(f"{tps:>5.0f}")
+                print(
+                    f"#   L={L:>5} N={N:>3}: {n_req:>4} reqs, p={p_tok:>8d}, "
+                    f"c={c_tok:>7d}, wall={wall:>6.1f}s, out_tps={tps:>6.1f}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                row.append("  ERR")
+                print(f"#   L={L} N={N}: {e}", file=sys.stderr)
+            seed_base += N + 7
+        print("  | ".join(row) + f" | {prefill_s:>6.2f}", flush=True)

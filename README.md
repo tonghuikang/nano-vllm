@@ -76,47 +76,66 @@ batched API.
 
 ### Prefix-length × concurrency sweep — Nano-vLLM vs vLLM, same hardware
 
-Same harness as `~/Desktop/setup/spark/bench_vllm.py`: each `(N, prefix_tokens)`
-cell sends N requests sharing one random prefix, `output_tokens =
-clamp(131072/N, 64, 1024)`, pinned with `min_tokens=max_tokens` and
-`ignore_eos=true`. Cell value is total decode tokens / wall time (tok/s).
-vLLM uses NGC image `nvcr.io/nvidia/vllm:26.03.post1-py3` (only image with
+Both engines benched over HTTP `/v1/completions` so the request paths
+match. Nano-vLLM is served by the bundled OpenAI-compatible server
+(`python -m nanovllm.server`, sources in
+[`nanovllm/server.py`](nanovllm/server.py)). Each `(N, prefix_tokens)`
+cell sends N concurrent requests sharing one random prefix,
+`output_tokens = clamp(131072/N, 64, 1024)`, pinned with
+`min_tokens=max_tokens` and `ignore_eos=true`. Cell value is total
+decode tokens / wall time (tok/s); the last column is cold-cache
+prefill wall at that prefix length (one decode step, fresh seed). vLLM
+uses NGC image `nvcr.io/nvidia/vllm:26.03.post1-py3` (only image with
 working sm_121 kernels), `--gpu-memory-utilization 0.75`,
 `max_num_batched_tokens=2048` (chunked prefill default). Nano-vLLM uses
 `gpu_memory_utilization=0.65`, `max_num_batched_tokens=16384`,
 `max_num_seqs=1024`.
 
-**Nano-vLLM** (in-process `LLM.generate`):
+**Nano-vLLM** (HTTP via `nanovllm.server`):
 
-| prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 131 | 551 | 1,524 | 2,641 | 5,489 | 14,375 |
-|  4,096 | 101 | 259 |   764 | 1,160 | 1,836 |  1,904 |
-| 32,768 |  39 |  87 |   227 |   265 |   —¹  |    —¹  |
+| prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 | prefill (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+|     1  | 120 | 544 | 1,518 | 2,671 | 5,475 | 13,431 | 0.20 |
+|  4,096 |  96 | 395 |   835 | 1,208 | 1,877 |  1,874 | 0.11 |
+| 32,768 |  38 |  85 |   228 |   266 |   286 |    281 | 2.21 |
 
 **vLLM** (NGC `26.03.post1-py3`, HTTP `/v1/completions`):
 
-| prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 136 | 555 | 1,382 | 2,489 | 5,535 | 12,584 |
-|  4,096 | 105 | 393 |   978 | 2,026 | 4,579 |  8,179 |
-| 32,768 |  38 |  95 |   334 | 1,088 | 2,326 |  3,003 |
-
-¹ Cell aborted: nano-vllm's prefill-then-decode-only scheduler stalls heavily
-on these cells; >5 min wall, throughput would have been < vLLM's.
+| prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 | prefill (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+|     1  | 124 | 533 | 1,380 | 2,515 | 5,709 | 12,716 | 0.01 |
+|  4,096 |  98 | 398 |   972 | 2,051 | 4,694 |  8,295 | 0.12 |
+| 32,768 |  38 |  77 |   373 | 1,130 | 2,476 |  3,008 | 2.41 |
 
 **Speed ratio (vLLM / Nano-vLLM)** — values < 1.10× mean parity:
 
 | prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 1.04× | 1.01× | 0.91× | 0.94× | 1.01× | 0.88× |
-|  4,096 | 1.04× | **1.52×** | **1.28×** | **1.75×** | **2.49×** | **4.30×** |
-| 32,768 | 0.97× | 1.09× | **1.47×** | **4.10×** | n/a | n/a |
+|     1  | 1.03× | 0.98× | 0.91× | 0.94× | 1.04× | 0.95× |
+|  4,096 | 1.02× | 1.01× | **1.16×** | **1.70×** | **2.50×** | **4.43×** |
+| 32,768 | 1.00× | 0.91× | **1.64×** | **4.25×** | **8.66×** | **10.71×** |
 
-Parity row at L=1 (no shared prefix to amortize): nano-vllm matches or beats
-vLLM. The gap opens up specifically on shared-prefix cells with concurrency
-≥ 4. Root causes documented in
-[`bench/PERF_GAP.md`](bench/PERF_GAP.md). Harnesses + raw logs live under
-[`bench/`](bench/) (`bench_concurrency.py` for nano-vllm in-process,
-`bench_vllm.py` for the vLLM HTTP path, `probe_nanovllm.py` for the
-focused diagnostic experiments).
+Parity row at L=1 (no shared prefix to amortize): nano-vllm matches or
+beats vLLM. The gap opens up specifically on shared-prefix cells with
+concurrency ≥ 16, and widens with both prefix length and concurrency —
+nano-vllm's throughput plateaus around 280 tok/s at L=32768 while vLLM
+keeps scaling to 3 k tok/s. Root causes documented in
+[`bench/PERF_GAP.md`](bench/PERF_GAP.md). Harnesses + raw logs live
+under [`bench/`](bench/): `bench_concurrency.py` drives the nano-vllm
+HTTP server, `bench_vllm.py` the vLLM container,
+`probe_nanovllm.py` runs the focused diagnostic experiments.
+
+To reproduce locally:
+
+```bash
+# terminal 1: serve nano-vllm
+uv run python -m nanovllm.server \
+  --model ~/huggingface/Qwen3-0.6B/ \
+  --gpu-memory-utilization 0.65 \
+  --max-num-batched-tokens 16384 \
+  --max-num-seqs 1024 \
+  --max-model-len 34816
+
+# terminal 2: run the sweep
+uv run python bench/bench_concurrency.py
+```
