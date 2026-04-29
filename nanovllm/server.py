@@ -214,7 +214,8 @@ def main() -> int:
     ap.add_argument("--max-model-len", type=int, default=34816)
     ap.add_argument("--max-num-seqs", type=int, default=1024)
     ap.add_argument("--max-num-batched-tokens", type=int, default=16384)
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    ap.add_argument("--kvcache-block-size", type=int, default=256, help="Must be a multiple of 256 (flash-attn paged-attention constraint).")
     ap.add_argument("--enforce-eager", action="store_true")
     args = ap.parse_args()
 
@@ -231,6 +232,7 @@ def main() -> int:
         max_num_batched_tokens=args.max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        kvcache_block_size=args.kvcache_block_size,
     )
     handler = _make_handler(service)
     srv = _ThreadedServer((args.host, args.port), handler)

@@ -31,6 +31,7 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.graph_max_bs = 0
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -182,9 +183,83 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_t = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+
+        # Find the longest common block_table prefix across all running seqs.
+        # block_manager dedups full blocks via xxhash, so identical block ids
+        # mean identical content. The last block of each seq is unique
+        # (newly-allocated for decode), so the common prefix never extends to
+        # any seq's tail. Required: every seq must have at least one block
+        # *beyond* the shared prefix (so the cascade suffix pass is non-empty).
+        #
+        # Cascade gate: N * shared_prefix_len ≥ 32 K. The cost we save is the
+        # N-fold redundant K/V re-read of the prefix; the cost we pay is two
+        # kernel launches plus an LSE merge. Empirically the crossover is
+        # around 32 K: L=4 k N=4 (16 K) regresses, L=32 k N=4 (128 K) wins.
+        shared_blocks: list[int] = []
+        shared_prefix_len = 0
+        cascade_min_blocks = 1
+        cascade_min_work = 32768
+        if len(seqs) >= 2:
+            common = list(seqs[0].block_table)
+            for seq in seqs[1:]:
+                bt = seq.block_table
+                i = 0
+                m = min(len(common), len(bt))
+                while i < m and common[i] == bt[i]:
+                    i += 1
+                common = common[:i]
+                if len(common) < cascade_min_blocks:
+                    common = []
+                    break
+            min_blocks_per_seq = min(len(seq.block_table) for seq in seqs)
+            if (len(common) >= cascade_min_blocks
+                    and len(common) < min_blocks_per_seq
+                    and len(seqs) * len(common) * self.block_size >= cascade_min_work):
+                shared_blocks = common
+                shared_prefix_len = len(common) * self.block_size
+
+        if shared_prefix_len > 0:
+            N = len(seqs)
+            num_shared = len(shared_blocks)
+            tail_rows = []
+            tail_lens_list = []
+            max_tail_blocks = max(len(seq.block_table) for seq in seqs) - num_shared
+            for seq, ctxlen in zip(seqs, context_lens):
+                tail = seq.block_table[num_shared:]
+                tail_rows.append(tail + [-1] * (max_tail_blocks - len(tail)))
+                tail_lens_list.append(ctxlen - shared_prefix_len)
+            shared_prefix_blocks_t = torch.tensor(shared_blocks, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            tail_block_tables_t = torch.tensor(tail_rows, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            tail_lens_t = torch.tensor(tail_lens_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            # Hoist the cu_seqlens tensors here so the 28 attention layers
+            # don't each pay the alloc + cumsum cost (was ~ms per step at
+            # high N).
+            cu_q_pref = torch.tensor([0, N], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_k_pref = torch.tensor([0, shared_prefix_len], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_q_suff = torch.arange(N + 1, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_k_suff_host = [0]
+            acc = 0
+            for tl in tail_lens_list:
+                acc += tl
+                cu_k_suff_host.append(acc)
+            cu_k_suff = torch.tensor(cu_k_suff_host, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            sig = hash(tuple(shared_blocks))
+            tail_max = max(tail_lens_list)
+        else:
+            shared_prefix_blocks_t = None
+            tail_block_tables_t = None
+            tail_lens_t = None
+            cu_q_pref = cu_k_pref = cu_q_suff = cu_k_suff = None
+            sig = 0
+            tail_max = 0
+
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens_t, block_tables=block_tables,
+                    shared_prefix_blocks=shared_prefix_blocks_t, shared_prefix_len=shared_prefix_len,
+                    shared_prefix_signature=sig, tail_block_tables=tail_block_tables_t, tail_lens=tail_lens_t,
+                    tail_max_len=tail_max,
+                    cu_q_pref=cu_q_pref, cu_k_pref=cu_k_pref, cu_q_suff=cu_q_suff, cu_k_suff=cu_k_suff)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -194,7 +269,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        ctx = get_context()
+        # Cascade decode goes through flash_attn_varlen_func twice + an LSE
+        # merge, none of which are in the captured graph. Run eager.
+        if is_prefill or self.enforce_eager or ctx.shared_prefix_len > 0 or input_ids.size(0) > self.graph_max_bs:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -223,7 +301,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = self.config.max_num_seqs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -231,7 +309,15 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Up to 512 we keep the original step-16 density (fine-grained padding
+        # waste matters for moderate batches). Above 512 we step by 64 — at
+        # those sizes one decode step is already long, padding 1023→1024 is
+        # noise but capturing 32 extra graphs would inflate startup time.
+        coarse = list(range(576, max_bs + 1, 64)) if max_bs > 512 else []
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, min(max_bs, 512) + 1, 16)) + coarse
+        if self.graph_bs[-1] != max_bs:
+            self.graph_bs.append(max_bs)
+        self.graph_max_bs = self.graph_bs[-1]
         self.graphs = {}
         self.graph_pool = None
 

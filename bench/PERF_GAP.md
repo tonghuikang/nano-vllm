@@ -1,110 +1,139 @@
 # Why nano-vllm trails vLLM on shared-prefix high-concurrency cells
 
-Measured on **NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory)**, Qwen3-0.6B,
-2026-04-27. See `bench_nanovllm.log` and `bench_vllm.log` for raw runs.
+Measured on **NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory)**, Qwen3-0.6B.
+See `bench_nanovllm.log` and `bench_vllm.log` for raw runs.
 
-The gap is concentrated on cells with **L ≥ 4096 AND N ≥ 4** — the L=1
-no-shared-prefix row stays within 1.14× of vLLM. That isolates the cause to
-nano-vllm's handling of shared-prefix concurrent workloads.
+The gap is concentrated on cells with **L ≥ 4 k AND N ≥ 16** — the L=1
+no-shared-prefix row stays at parity (within 5–10 % either way). That isolated
+the cause to nano-vllm's handling of long shared-prefix concurrent workloads.
 
-## Diagnosis (on the L=4096 N=64 cell, vLLM 2026 → nano-vllm 1152 tok/s, gap 1.75×)
+## What we found
 
-Five focused experiments using the same model/hardware (`probe_nanovllm.py`):
+The earlier draft of this doc blamed per-step Python↔GPU sync. Profiler
+disproved it: 99.6 % of the L=4 k N=64 step is GPU compute, only 0.2 % is
+Python prep / dispatch. The `.tolist()` line **is** a `cudaSync`, but what
+the engine is actually waiting on is the GPU — paged-attention reads
+were doing N independent fetches of the shared prefix's K/V every step,
+and that dominates everything else at any meaningful (L, N).
 
-| variant | knob change | tok/s | Δ vs baseline |
-| --- | --- | ---: | ---: |
-| A baseline | default                            | 1152 | — |
-| B serial cold prefill | `max_num_batched_tokens=2048`         | 1192 | +3% |
-| C prefix pre-warmed | warmup pass before timed cell        | 1198 | +4% |
-| D smaller decode batch | `max_num_seqs=256`                | 1154 | +0% |
-| E eager mode | `enforce_eager=True` (no CUDA graph)        | 1123 | −3% |
+### What we did
 
-**vLLM is 1.75× faster, but no nano-vllm knob recovers more than 4%.** The
-bottleneck is not in the configurable scheduler/cache machinery — it's in
-the per-step engine path.
+Implemented **two-pass shared-prefix attention with LSE merging** in
+[`nanovllm/layers/attention.py`](../nanovllm/layers/attention.py),
+following vLLM's pattern (refs:
+[`vllm/v1/attention/backends/flash_attn.py`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flash_attn.py)
+`cascade_attention()` and
+[`vllm/v1/attention/ops/triton_merge_attn_states.py`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_merge_attn_states.py)).
 
-## Root cause: per-step CPU↔GPU synchronization
+In one decode step, when ≥ 2 running seqs share a non-trivial prefix:
 
-`engine/model_runner.py` runs decode like this for every single token:
+1. **Prefix pass.** All N queries go through `flash_attn_varlen_func` as
+   one varlen "sequence" attending non-causally over the shared prefix's
+   paged blocks. The kernel loads the prefix's K/V once and reuses it
+   across the N queries via L1/L2/SMEM. Per-step KV-cache HBM traffic
+   for the prefix portion drops from O(N · L) to O(L).
 
-```python
-def run(self, seqs, is_prefill):
-    input_ids, positions = self.prepare_decode(seqs)        # CPU lists → pin_memory → cuda(async)
-    temperatures = self.prepare_sample(seqs)                # same
-    logits = self.run_model(input_ids, positions, False)    # CUDA-graph replay
-    token_ids = self.sampler(logits, temperatures).tolist() # ⚠ forces cudaSynchronize + D2H
-    reset_context()
-    return token_ids
-```
+2. **Suffix pass.** Each seq's query attends causally over its unique
+   tail (block_table[num_shared_blocks:]) via `flash_attn_varlen_func`.
+   Standard per-seq paged attention but over a much shorter context.
 
-The `.tolist()` blocks until sampling finishes, copies tokens to host, and
-**only then** can the engine call `scheduler.postprocess` and start the next
-step. Per-step Python work + sync sits in series with GPU compute, not in
-parallel.
+3. **Merge.** Compose the two outputs via softmax-LSE composition
+   (arxiv:2501.01005 §2.2): `out = (p_se · out_p + s_se · out_s) /
+   (p_se + s_se)` where `p_se = exp(lse_p - max(lse_p, lse_s))`.
 
-Order-of-magnitude estimate at L=4096 N=64:
+Plumbing changes:
+- [`nanovllm/utils/context.py`](../nanovllm/utils/context.py): added
+  `shared_prefix_blocks`, `shared_prefix_len`, `tail_block_tables`,
+  `tail_lens`, `tail_max_len` fields.
+- [`nanovllm/engine/model_runner.py`](../nanovllm/engine/model_runner.py)
+  `prepare_decode`: walks the running seqs' `block_table`s to find the
+  longest common prefix (block_manager.xxhash already dedups full blocks,
+  so identical block ids ⇒ identical content). Pre-computes
+  `tail_max_len` on the host so the cascade kernel call doesn't need a
+  per-step `.item()` sync.
+- A gate skips cascade when `N · shared_prefix_len < 32 K` — empirically
+  the crossover between "two extra kernel launches + an LSE merge" and
+  "the per-seq kernel reads K/V N times". L=4 k N=4 (16 K) regresses
+  with cascade on; L=32 k N=4 (128 K) is a win.
+- CUDA graph is bypassed when cascade is active (the cascade path is
+  not graph-friendly; eager dispatch is fine because the kernels do all
+  the heavy lifting).
 
-- **GPU compute / step** for batch-64 decode at ~5 k tokens of KV ≈ 30 ms
-  (memory-bandwidth-bound on Spark; Qwen3-0.6B has GQA-8/28-layers).
-- **Total decode**: 1024 steps × 30 ms ≈ 30 s.
-- **Observed wall**: 55 s. → **per-step overhead ≈ 24 ms** sitting between
-  GPU steps.
-- **vLLM wall**: 32 s → per-step overhead ≈ 3 ms.
+Also landed:
+- `model_runner.capture_cudagraph` now captures up to `max_num_seqs`
+  (was capped at 512), so non-cascade decodes at N > 512 stop falling
+  back to eager.
+- `nanovllm.server` default `--gpu-memory-utilization` bumped from 0.5
+  to 0.85. Profile of L=4 k N=1024 with the lower setting showed
+  `bs=74` dominant (instead of the expected 1024) — the KV pool only
+  fit ~1,915 blocks while the cell needs ~2,063, so the scheduler was
+  preempting on every step. At 0.85 the pool holds ~2,805 blocks and
+  bs=1024 stays steady.
 
-So nano-vllm spends **~22 ms per decode step waiting on Python**, doubling
-wall time. vLLM eliminates this by:
+### Bench impact
 
-1. **Async sampler** — next-token IDs are produced on the GPU and the
-   scheduler kicks off the next step's `prepare_decode` *before* the
-   sampler's host copy lands. (See vLLM's `output_processor` thread.)
-2. **Pre-allocated input buffers** — vLLM's CUDA graph captures
-   include the input tensors, so per-step host work is just
-   `memcpy_async` into pinned device buffers, not Python list construction
-   + `torch.tensor(...).cuda()`.
-3. **Mixed prefill+decode batches** — vLLM admits a small number of
-   prefill tokens *into the same step* as running decodes, so prefill
-   doesn't stall in-flight decodes. nano-vllm's `Scheduler.schedule()`
-   returns `(seqs, is_prefill)` — strictly one mode per step (see
-   `engine/scheduler.py:25-73`), so during the few prefill steps at the
-   start of a high-N cell, all already-running decodes are paused.
+L=1 row holds parity (cascade gate keeps it on the existing path).
+Shared-prefix cells (final numbers at `gpu_memory_utilization=0.85`,
+which is enough for the ~2,063 blocks L=4 k N=1024 needs without
+preemption):
 
-(3) compounds (1)+(2) at higher concurrency: every prefill step is a wider
-stall, which is why the gap grows from 1.04× at N=1 to 4.30× at N=1024.
+| | pre-cascade | post-cascade | vLLM | Δ vs pre |
+| --- | ---: | ---: | ---: | ---: |
+| L=4 k N=64    | 1208 | 1565 | 2051 | +30 % |
+| L=4 k N=256   | 1877 | 2724 | 4694 | +45 % |
+| L=4 k N=1024  | 1874 | 3474 | 8295 | +85 % |
+| L=32 k N=64   | 266  | 979  | 1130 | +268 % |
+| L=32 k N=256  | 286  | 1762 | 2476 | +516 % |
+| L=32 k N=1024 | 281  | 1684 | 3008 | +499 % |
 
-## Other things ruled out
+vLLM ratios (nano-vllm / vLLM):
 
-- **Prefix-cache race in `Scheduler`** (multiple cold prefills of the same
-  prefix admitted in a single step at `max_num_batched_tokens=16384`): real,
-  but worth only ~3% (probe B). At L=4096 only 4 prompts can fit, so worst
-  case 3 redundant cold prefills ≈ 1.5 s out of a 55 s cell.
-- **Prefill kernel quality**: nano-vllm uses `flash_attn_varlen_func` (same
-  family as vLLM's). Probe C (warm cache → almost no prefill work) doesn't
-  close the gap.
-- **CUDA graph capture**: probe E shows graphs save only ~3% on this cell.
-  The cell isn't compute-bound enough for graph replay vs eager to matter.
-- **Decode batch ceiling (`max_num_seqs=512`)**: probe D drops it to 256
-  with no effect, ruling out batch-size-related throttling at this N.
-- **GPU memory contention**: nano-vllm here gets `gpu_memory_utilization=0.65`
-  → ~32 GB KV pool, well within Spark's 128 GB. KV cache is not the
-  binding constraint.
+| | pre-cascade | post-cascade |
+| --- | ---: | ---: |
+| L=4 k N=1024  | 0.23× | 0.42× |
+| L=32 k N=64   | 0.24× | 0.87× |
+| L=32 k N=256  | 0.12× | 0.71× |
+| L=32 k N=1024 | 0.09× | 0.56× |
 
-## Where the gap could be closed (priority order)
+## What still keeps us behind vLLM
 
-1. **Async sampler / overlap host↔device sync with the next prepare**.
-   Easy win — biggest single contributor to the per-step overhead. Pattern:
-   issue sampler kernel, return a CUDA event, start the next
-   `prepare_decode` immediately, only wait on the event right before the
-   block-manager bookkeeping that needs the actual token IDs.
-2. **Capture `prepare_decode` into the CUDA graph**. Today the graph
-   captures `model(input_ids, positions)` but `input_ids`, `positions`,
-   `slot_mapping`, `context_lens`, `block_tables` are rebuilt host-side
-   every step (`prepare_decode` at `model_runner.py:172-188`). Move those
-   into pre-allocated pinned-host buffers and slot-fill in place.
-3. **Mix prefill+decode in one step.** Allow `Scheduler.schedule()` to
-   return a small prefill chunk *plus* the running decode batch, so the
-   first few prefill steps of a high-N cell don't stall in-flight
-   decodes. Hardest of the three; meaningful only at N ≥ 16.
+At very high concurrency (N ≥ 256) on the moderate-prefix row (L=4 k),
+nano-vllm is at ~0.4× of vLLM. Two likely causes:
 
-The L=1 row already matching vLLM tells you the kernels and the basic
-block manager are fine — the gap is engine-overhead-shaped, not
-compute-shaped.
+1. **Suffix kernel quality at N=1024.** The per-seq tails fan out to
+   1024 unique block_tables. `flash_attn_varlen_func` with
+   `cu_seqlens_q = [0, 1, …, 1024]` parallelises across batches but the
+   per-batch K/V access pattern is randomised across the paged cache;
+   L2 thrashes. vLLM uses kernels that are tuned for this regime
+   (batched-decode in FlashInfer or FA3 on Blackwell).
+2. **No cascade-path CUDA graph.** Cascade dispatch is eager, so the
+   28 layers each pay launch + dispatch overhead per step. Not the
+   dominant cost at L=32 k (compute-bound) but matters at L=4 k where
+   the kernels are quick.
+
+Concrete next steps:
+- Try `flashinfer.BatchDecodeWithSharedPrefix` — same concept but a
+  kernel tuned for it (vLLM's choice when the dep is available).
+- Capture a cascade-mode CUDA graph keyed on `(N, num_shared_blocks,
+  max_tail_blocks)` since within a benchmark cell those are stable.
+- For the suffix pass, if `flash_attn_with_kvcache` ever beats
+  `flash_attn_varlen_func` for high-N moderate-tail decodes, switch
+  per-cell. (We measured: kvcache regresses L=4 k N=64 by 27 %, parity
+  elsewhere — varlen is the better default.)
+
+## Things ruled out by experiment
+
+- **Async sampler / pinned input buffers / prefill+decode mixing.**
+  Profiler showed each targets sub-1 % of measured step time. None
+  were going to close a gap that lives on the GPU.
+- **CUDA graph capture cap (was 512).** Lifted to `max_num_seqs`. No
+  measurable benefit on this bench, confirming the cell isn't
+  bottlenecked by graph dispatch overhead.
+- **`torch.compile(dynamic=True)`** on RMSNorm and Sampler. Avoids
+  recompile_limit warnings but slightly regressed L=4 k N=4 (within
+  noise). Reverted.
+
+The L=1 row already matching vLLM tells you nothing about the L=4 k or
+L=32 k gap — the L=1 path doesn't exercise the per-seq paged-attention
+read pattern that scales with prefix length. The cascade fix is what
+removed that scaling.

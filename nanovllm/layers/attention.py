@@ -40,6 +40,55 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def _cascade_decode(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, scale: float, ctx) -> torch.Tensor:
+    """Two-pass shared-prefix attention via flash_attn_varlen_func.
+
+    Pass 1 (prefix): treat all N queries as a single varlen "sequence" attending
+    *non-causally* over the shared prefix blocks. The kernel loads the prefix
+    K/V once and reuses it across the N queries from L1/L2/SMEM, dropping
+    per-step KV-cache HBM traffic from O(N·L_prefix) to O(L_prefix).
+
+    Pass 2 (suffix): each seq's query attends *causally* over its unique tail
+    (block_table[num_shared_blocks:]). Standard per-seq paged attention, but
+    over a much shorter context.
+
+    Pass 3 (merge): compose via softmax-LSE — see arxiv:2501.01005 §2.2.
+
+    cu_seqlens tensors live on `ctx`; they're built once per step by
+    `prepare_decode` and reused across all 28 attention layers.
+    """
+    N = q.size(0)
+
+    # Pass 1: prefix attention.
+    out_p, lse_p, _ = flash_attn_varlen_func(
+        q, k_cache, v_cache,
+        cu_seqlens_q=ctx.cu_q_pref, cu_seqlens_k=ctx.cu_k_pref,
+        max_seqlen_q=N, max_seqlen_k=ctx.shared_prefix_len,
+        softmax_scale=scale, causal=False,
+        block_table=ctx.shared_prefix_blocks.unsqueeze(0),
+        return_attn_probs=True,
+    )
+
+    # Pass 2: suffix attention.
+    out_s, lse_s, _ = flash_attn_varlen_func(
+        q, k_cache, v_cache,
+        cu_seqlens_q=ctx.cu_q_suff, cu_seqlens_k=ctx.cu_k_suff,
+        max_seqlen_q=1, max_seqlen_k=ctx.tail_max_len,
+        softmax_scale=scale, causal=True,
+        block_table=ctx.tail_block_tables,
+        return_attn_probs=True,
+    )
+
+    # Pass 3: merge. lse_p, lse_s shape [num_heads, N]; out_p, out_s [N, num_heads, head_dim].
+    max_lse = torch.maximum(lse_p, lse_s)
+    p_se = torch.exp(lse_p - max_lse)
+    s_se = torch.exp(lse_s - max_lse)
+    inv = 1.0 / (p_se + s_se)
+    p_scale = (p_se * inv).transpose(0, 1).unsqueeze(-1).to(out_p.dtype)
+    s_scale = (s_se * inv).transpose(0, 1).unsqueeze(-1).to(out_s.dtype)
+    return out_p * p_scale + out_s * s_scale
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -68,8 +117,10 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+        elif context.shared_prefix_len > 0:    # decode w/ cascade
+            o = _cascade_decode(q, k_cache, v_cache, self.scale, context)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o
