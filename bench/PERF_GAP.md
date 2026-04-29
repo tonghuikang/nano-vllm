@@ -55,9 +55,10 @@ Plumbing changes:
   the crossover between "two extra kernel launches + an LSE merge" and
   "the per-seq kernel reads K/V N times". L=4 k N=4 (16 K) regresses
   with cascade on; L=32 k N=4 (128 K) is a win.
-- CUDA graph is bypassed when cascade is active (the cascade path is
-  not graph-friendly; eager dispatch is fine because the kernels do all
-  the heavy lifting).
+- Cascade decode has CUDA graph capture keyed on
+  `(N, num_shared_blocks, max_tail_blocks)`. The tail table is sized for
+  the largest context the batch can reach before completion, so long
+  decode runs do not recapture each time they cross a KV block boundary.
 
 Also landed:
 - `model_runner.capture_cudagraph` now captures up to `max_num_seqs`
@@ -73,29 +74,57 @@ Also landed:
 ### Bench impact
 
 L=1 row holds parity (cascade gate keeps it on the existing path).
-Shared-prefix cells (final numbers at `gpu_memory_utilization=0.85`,
-which is enough for the ~2,063 blocks L=4 k N=1024 needs without
-preemption):
+Shared-prefix cells (original cascade numbers at
+`gpu_memory_utilization=0.85`, which is enough for the ~2,063 blocks
+L=4 k N=1024 needs without preemption). The N=64 rows also include the
+fresh repeated HTTP medians after cascade CUDA graph capture:
 
-| | pre-cascade | post-cascade | vLLM | Δ vs pre |
-| --- | ---: | ---: | ---: | ---: |
-| L=4 k N=64    | 1208 | 1565 | 2051 | +30 % |
-| L=4 k N=256   | 1877 | 2724 | 4694 | +45 % |
-| L=4 k N=1024  | 1874 | 3474 | 8295 | +85 % |
-| L=32 k N=64   | 266  | 979  | 1130 | +268 % |
-| L=32 k N=256  | 286  | 1762 | 2476 | +516 % |
-| L=32 k N=1024 | 281  | 1684 | 3008 | +499 % |
+| | pre-cascade | cascade eager | current | vLLM | Δ vs pre |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| L=4 k N=64    | 1208 | 1565 | 2271.6 | 2066.3 | +88 % |
+| L=4 k N=256   | 1877 | 2724 | - | 4694 | +45 % |
+| L=4 k N=1024  | 1874 | 3474 | - | 8295 | +85 % |
+| L=32 k N=64   | 266  | 979  | 1308.4 | 1131.0 | +392 % |
+| L=32 k N=256  | 286  | 1762 | - | 2476 | +516 % |
+| L=32 k N=1024 | 281  | 1684 | - | 3008 | +499 % |
 
 vLLM ratios (nano-vllm / vLLM):
 
-| | pre-cascade | post-cascade |
-| --- | ---: | ---: |
-| L=4 k N=1024  | 0.23× | 0.42× |
-| L=32 k N=64   | 0.24× | 0.87× |
-| L=32 k N=256  | 0.12× | 0.71× |
-| L=32 k N=1024 | 0.09× | 0.56× |
+| | pre-cascade | cascade eager | current |
+| --- | ---: | ---: | ---: |
+| L=4 k N=64    | 0.59× | 0.76× | 1.10× |
+| L=4 k N=1024  | 0.23× | 0.42× | - |
+| L=32 k N=64   | 0.24× | 0.87× | 1.16× |
+| L=32 k N=256  | 0.12× | 0.71× | - |
+| L=32 k N=1024 | 0.09× | 0.56× | - |
 
 ## What still keeps us behind vLLM
+
+### 2026-04-28 follow-up: cascade CUDA graph
+
+The cascade decode path now has CUDA graph capture keyed on
+`(N, num_shared_blocks, max_tail_blocks)`. The tail table is sized for the
+largest context the batch can reach before completion, so the graph key stays
+stable when decode crosses later KV block boundaries.
+
+This follow-up also fixed a `BlockManager.hash_blocks` correctness issue where
+a hashed block could be evicted from `used_block_ids` while its hash entry
+remained live, then later be deduplicated back into a sequence without being
+removed from `free_block_ids`. That stale free-list state could surface as a
+later deallocation `KeyError`.
+
+Repeated HTTP measurements recorded in
+[`bench/raw_n64_verification_20260429/`](raw_n64_verification_20260429/):
+
+| prefix | N | output tok/s | note |
+| ---: | ---: | ---: | --- |
+| 1 | 64 | 2968.6 | median of 3 nano-vLLM runs, no-prefix control; vLLM median 2522.3 |
+| 4096 | 64 | 2271.6 | median of 3 nano-vLLM runs; vLLM median 2066.3 |
+| 32768 | 64 | 1308.4 | median of 3 nano-vLLM runs, long-prefix control; vLLM median 1131.0 |
+
+The fresh repeated vLLM L=4096/N=64 median on the same DGX Spark/Qwen3-0.6B
+setup is 2066.3 tok/s, so the target cell now measures 1.10x vLLM by median
+HTTP throughput.
 
 At very high concurrency (N ≥ 256) on the moderate-prefix row (L=4 k),
 nano-vllm is at ~0.4× of vLLM. Two likely causes:
@@ -106,20 +135,27 @@ nano-vllm is at ~0.4× of vLLM. Two likely causes:
    per-batch K/V access pattern is randomised across the paged cache;
    L2 thrashes. vLLM uses kernels that are tuned for this regime
    (batched-decode in FlashInfer or FA3 on Blackwell).
-2. **No cascade-path CUDA graph.** Cascade dispatch is eager, so the
-   28 layers each pay launch + dispatch overhead per step. Not the
-   dominant cost at L=32 k (compute-bound) but matters at L=4 k where
-   the kernels are quick.
 
 Concrete next steps:
-- Try `flashinfer.BatchDecodeWithSharedPrefix` — same concept but a
-  kernel tuned for it (vLLM's choice when the dep is available).
-- Capture a cascade-mode CUDA graph keyed on `(N, num_shared_blocks,
-  max_tail_blocks)` since within a benchmark cell those are stable.
-- For the suffix pass, if `flash_attn_with_kvcache` ever beats
-  `flash_attn_varlen_func` for high-N moderate-tail decodes, switch
-  per-cell. (We measured: kvcache regresses L=4 k N=64 by 27 %, parity
-  elsewhere — varlen is the better default.)
+- FlashInfer is now available in the local uv environment
+  (`flashinfer-python[cu13]` + `flashinfer-cubin` 0.6.9; `show-config`
+  reports CUDA 13.0 / SM 12.1). `NANO_VLLM_CASCADE_SUFFIX_KERNEL=flashinfer`
+  selects an opt-in `MultiLevelCascadeAttentionWrapper` path over the existing
+  paged KV cache. On the target L=4 k N=64 focused probe it reached
+  2144.2 tok/s, clearing the target but trailing the CUDA-graphed varlen
+  cascade, so it remains non-default. Re-test it on the N ≥ 256 L=4 k cells,
+  where suffix-kernel quality is the suspected limiter.
+- `NANO_VLLM_CASCADE_SUFFIX_KERNEL=flashinfer_shared` selects FlashInfer's
+  exact shared-prefix paged decode wrapper when the model runs in float16. It
+  is not viable for the default Qwen3-0.6B bfloat16 benchmark on the installed
+  FlashInfer build, so bf16 runs fail early with a clear error instead of
+  entering the wrapper and failing later.
+- For the suffix pass, `NANO_VLLM_CASCADE_SUFFIX_KERNEL=kvcache` selects
+  `flash_attn_with_kvcache` instead of the default `flash_attn_varlen_func`.
+  After cascade graphing it was roughly parity on the target L=4 k N=64
+  focused probe (2231 tok/s vs 2248 recorded for varlen), so varlen remains
+  the default. Earlier pre-cascade measurement had kvcache regressing
+  L=4 k N=64 by 27 %, with parity elsewhere.
 
 ## Things ruled out by experiment
 
@@ -129,6 +165,8 @@ Concrete next steps:
 - **CUDA graph capture cap (was 512).** Lifted to `max_num_seqs`. No
   measurable benefit on this bench, confirming the cell isn't
   bottlenecked by graph dispatch overhead.
+- **Cascade-path CUDA graph.** Implemented after the original cascade pass;
+  it moved the target L=4 k N=64 cell above the recorded vLLM baseline.
 - **`torch.compile(dynamic=True)`** on RMSNorm and Sampler. Avoids
   recompile_limit warnings but slightly regressed L=4 k N=4 (within
   noise). Reverted.
