@@ -38,9 +38,9 @@ Ratio vs the checked-in `bench/bench_vllm.txt` reference:
 
 | prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.97x | 1.03x | 1.21x | 1.85x | 1.45x | 1.11x |
-| 4096 | 0.97x | 1.06x | 1.18x | 1.14x | 1.02x | 1.19x |
-| 32768 | 1.00x | 1.73x | 1.29x | 1.16x | 1.10x | 1.24x |
+| 1 | 1.00x | 1.01x | 1.11x | 1.80x | 1.52x | 0.98x |
+| 4096 | 0.99x | 1.11x | 1.22x | 1.22x | 1.10x | 1.04x |
+| 32768 | 1.04x | 1.78x | 1.49x | 1.31x | 1.18x | 1.00x |
 
 All 18 cells are >= 0.95x against that reference.
 
@@ -108,8 +108,3 @@ Ratio = nano-vLLM median / fresh vLLM median:
 
 All 18 cells are >= 0.95x against the fresh vLLM medians from the same 0.80
 capacity configuration. The lowest ratio is 0.978x at `prefix=1,N=1024`.
-
-The failed earlier attempt is preserved in
-`bench/raw_vllm_full_sweep_20260429_valid/vllm_full_run_failed_client_oom.*`;
-it completed server-side but the client was killed before recording the final
-cell.
