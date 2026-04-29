@@ -98,7 +98,13 @@ vLLM ratios (nano-vllm / vLLM):
 | L=32 k N=256  | 0.12× | 0.71× | - |
 | L=32 k N=1024 | 0.09× | 0.56× | - |
 
-## What still keeps us behind vLLM
+## Resolved follow-ups
+
+Nothing remaining at the parity tolerance. The fresh median-of-3 full sweep in
+[`bench/FULL_SWEEP_20260429.md`](FULL_SWEEP_20260429.md) has all 18 cells at or
+above 0.95x vLLM, with the weakest cell at 0.978x
+(`prefix=1,N=1024`). The README tables now publish those fresh medians rather
+than the older pre-cascade numbers.
 
 ### 2026-04-28 follow-up: cascade CUDA graph
 
@@ -126,17 +132,47 @@ The fresh repeated vLLM L=4096/N=64 median on the same DGX Spark/Qwen3-0.6B
 setup is 2066.3 tok/s, so the target cell now measures 1.10x vLLM by median
 HTTP throughput.
 
-Additional single-run focused probes against the already-running nano-vLLM
-server on 2026-04-29 (`gpu_memory_utilization=0.85`,
+Additional pre-fix single-run focused probes against the already-running
+nano-vLLM server on 2026-04-29 (`gpu_memory_utilization=0.85`,
 `max_num_batched_tokens=16384`, default varlen cascade):
 
 | prefix | N | output tok/s | vLLM reference | ratio | note |
 | ---: | ---: | ---: | ---: | ---: | --- |
 | 4096 | 256 | 4482.5 | 4694 | 0.955x | clears target on this run; still needs median-of-3 confirmation |
-| 4096 | 1024 | 6345.9 | 8295 | 0.765x | still below target |
+| 4096 | 1024 | 6345.9 | 8295 | 0.765x | failed target before exact-block fix |
 
-At very high concurrency (N ≥ 1024) on the moderate-prefix row (L=4 k),
-nano-vllm is still short of vLLM. The likely cause:
+### 2026-04-29 follow-up: exact-block full cache hits
+
+The sweep prompts at L=4096 and L=32768 end exactly on a 256-token KV block
+boundary. `BlockManager.can_allocate()` previously kept the last prompt block
+private so a prefix-cache hit always had at least one prefill block to run.
+That was correct for partial final blocks, but it made exact-block prompts keep
+256 prompt tokens in each sequence's cascade suffix. At N=1024 that reintroduced
+262k tokens of per-step suffix attention work.
+
+The scheduler now allows exact-block prompts to cache the final prompt block and
+handles a full-cache hit by moving the sequence directly into decode, where the
+first decode step recomputes only the last prompt token and subsequent steps
+share the complete prompt prefix.
+
+Repeated HTTP measurements recorded in
+[`bench/raw_focused_verification_20260429_iter/`](raw_focused_verification_20260429_iter/)
+after this change (`nanovllm_fullblock_varlen_probe*.err`):
+
+| prefix | N | nano-vLLM median tok/s | vLLM reference | ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 4096 | 256 | 4792.7 | 4694 | 1.02x |
+| 4096 | 1024 | 9466.1 | 8295 | 1.14x |
+| 32768 | 256 | 2817.7 | 2476 | 1.14x |
+| 32768 | 1024 | 3625.8 | 3008 | 1.21x |
+
+Pre-fix medians from the same run directory (`nanovllm_varlen_run*.err`) were
+4595.6, 6480.6, 2444.5, and 2171.1 tok/s respectively, so the gain is
+concentrated where the duplicated exact-block suffix was largest.
+
+At very high concurrency (N >= 1024) on the moderate-prefix row (L=4 k), the
+only residual watch item is full-sweep repeatability rather than a measured
+focused-cell gap. If a future full sweep regresses, the next likely limiter is:
 
 1. **Suffix kernel quality at N=1024.** The per-seq tails fan out to
    1024 unique block_tables. `flash_attn_varlen_func` with
@@ -145,15 +181,14 @@ nano-vllm is still short of vLLM. The likely cause:
    L2 thrashes. vLLM uses kernels that are tuned for this regime
    (batched-decode in FlashInfer or FA3 on Blackwell).
 
-Concrete next steps:
+Historical kernel alternatives:
 - FlashInfer is now available in the local uv environment
   (`flashinfer-python[cu13]` + `flashinfer-cubin` 0.6.9; `show-config`
   reports CUDA 13.0 / SM 12.1). `NANO_VLLM_CASCADE_SUFFIX_KERNEL=flashinfer`
   selects an opt-in `MultiLevelCascadeAttentionWrapper` path over the existing
   paged KV cache. On the target L=4 k N=64 focused probe it reached
   2144.2 tok/s, clearing the target but trailing the CUDA-graphed varlen
-  cascade, so it remains non-default. Re-test it on the N ≥ 256 L=4 k cells,
-  where suffix-kernel quality is the suspected limiter.
+  cascade, so it remains non-default.
 - `NANO_VLLM_CASCADE_SUFFIX_KERNEL=flashinfer_shared` selects FlashInfer's
   exact shared-prefix paged decode wrapper when the model runs in float16. It
   is not viable for the default Qwen3-0.6B bfloat16 benchmark on the installed
@@ -165,6 +200,10 @@ Concrete next steps:
   focused probe (2231 tok/s vs 2248 recorded for varlen), so varlen remains
   the default. Earlier pre-cascade measurement had kvcache regressing
   L=4 k N=64 by 27 %, with parity elsewhere.
+
+## What still keeps us behind vLLM
+
+Nothing remaining at the parity tolerance.
 
 ## Things ruled out by experiment
 

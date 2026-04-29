@@ -69,7 +69,12 @@ class BlockManager:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
+        # A partial final block cannot be reused because decode will append to
+        # it. If the prompt ends exactly on a block boundary, the final prompt
+        # block is immutable and can be shared too; the scheduler handles that
+        # full-cache hit by entering decode directly.
+        num_cacheable_blocks = seq.num_blocks if len(seq) % self.block_size == 0 else seq.num_blocks - 1
+        for i in range(num_cacheable_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)

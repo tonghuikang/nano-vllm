@@ -158,6 +158,10 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Local agent/tool state
+.claude/
+skills/
+
 # Cython debug symbols
 cython_debug/
 

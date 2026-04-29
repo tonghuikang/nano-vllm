@@ -27,7 +27,7 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while self.waiting and len(self.running) + len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
@@ -39,6 +39,13 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+            if num_tokens == 0:
+                if not seq.block_table:
+                    self.block_manager.allocate(seq, num_cached_blocks)
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
+                continue
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:

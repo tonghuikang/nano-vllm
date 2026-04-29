@@ -92,9 +92,11 @@ batched API.
 | | Nano-vLLM | vLLM |
 | --- | --- | --- |
 | server | `python -m nanovllm.server` ([`nanovllm/server.py`](nanovllm/server.py)) | NGC `nvcr.io/nvidia/vllm:26.03.post1-py3` (only image with working sm_121 kernels) |
-| `gpu_memory_utilization` | 0.85 | 0.75 |
+| `gpu_memory_utilization` | 0.85 | 0.80 |
 | `max_num_batched_tokens` | 16384 | 2048 (chunked prefill default) |
-| `max_num_seqs` | 1024 | default |
+| `max_num_seqs` | 1024 | 1024 |
+| `max_model_len` | 34816 | 34816 |
+| KV-cache block size | 256 | default |
 
 The higher nano-vllm `gpu_memory_utilization` keeps ~2,800 KV blocks live —
 enough to avoid preemption at 1024 concurrent seqs with L=4 k or L=32 k
@@ -106,27 +108,31 @@ attention enabled when `N · shared_prefix ≥ 32 k` —
 
 | prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 | prefill (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 120 | 554 | 1,551 | 2,969 | 5,707 | 14,153 | 0.20 |
-|  4,096 |  95 | 396 |   884 | 2,272 | 2,839 |  3,613 | 0.11 |
-| 32,768 |  38 |  95 |   321 | 1,308 | 1,704 |  1,692 | 2.20 |
+|     1  | 120.0 | 550.4 | 1,663.8 | 4,656.9 | 8,253.2 | 14,078.6 | 0.01 |
+|  4,096 |  95.5 | 422.2 | 1,150.6 | 2,342.8 | 4,808.0 |  9,834.0 | 0.11 |
+| 32,768 |  37.9 | 132.9 |   480.3 | 1,308.4 | 2,722.0 |  3,722.6 | 2.20 |
 
 **vLLM** (NGC `26.03.post1-py3`, HTTP `/v1/completions`):
 
 | prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 | prefill (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 124 | 533 | 1,380 | 2,522 | 5,709 | 12,716 | 0.01 |
-|  4,096 |  98 | 398 |   972 | 2,066 | 4,694 |  8,295 | 0.12 |
-| 32,768 |  38 |  77 |   373 | 1,131 | 2,476 |  3,008 | 2.41 |
+|     1  | 119.8 | 544.3 | 1,502.6 | 2,588.5 | 5,446.7 | 14,389.6 | 0.01 |
+|  4,096 |  96.8 | 380.3 |   940.1 | 1,925.3 | 4,366.9 |  9,422.0 | 0.12 |
+| 32,768 |  36.4 |  74.7 |   323.2 |   998.0 | 2,311.7 |  3,706.2 | 2.58 |
 
 **Speed ratio (vLLM / Nano-vLLM)** — values ≤ 1.10× mean parity, < 1
 means nano-vllm beats vLLM:
 
 | prefix \ N | 1 | 4 | 16 | 64 | 256 | 1024 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-|     1  | 1.03× | 0.96× | 0.89× | 0.85× | 1.00× | 0.90× |
-|  4,096 | 1.03× | 1.01× | **1.10×** | 0.91× | **1.65×** | **2.30×** |
-| 32,768 | 1.00× | **0.81×** | **1.16×** | 0.86× | **1.45×** | **1.78×** |
+|     1  | 1.00× | 0.99× | 0.90× | 0.56× | 0.66× | 1.02× |
+|  4,096 | 1.01× | 0.90× | 0.82× | 0.82× | 0.91× | 0.96× |
+| 32,768 | 0.96× | 0.56× | 0.67× | 0.76× | 0.85× | 1.00× |
 
+Fresh median-of-3 sweeps and raw per-iteration logs are documented in
+[`bench/FULL_SWEEP_20260429.md`](bench/FULL_SWEEP_20260429.md). Summary tables:
+[`bench/bench_nanovllm.txt`](bench/bench_nanovllm.txt) and
+[`bench/bench_vllm.txt`](bench/bench_vllm.txt).
 
 To reproduce locally:
 
@@ -134,11 +140,18 @@ To reproduce locally:
 # terminal 1: serve nano-vllm
 uv run python -m nanovllm.server \
   --model ~/huggingface/Qwen3-0.6B/ \
+  --host 127.0.0.1 --port 8001 \
   --gpu-memory-utilization 0.85 \
   --max-num-batched-tokens 16384 \
   --max-num-seqs 1024 \
-  --max-model-len 34816
+  --max-model-len 34816 \
+  --kvcache-block-size 256
 
 # terminal 2: run the sweep
-uv run python bench/bench_concurrency.py
+for i in 1 2 3; do
+  uv run python bench/bench_concurrency.py \
+    --url http://127.0.0.1:8001/v1/completions \
+    > bench/raw_full_sweep_20260429_iter/nanovllm_full_run${i}.out \
+    2> bench/raw_full_sweep_20260429_iter/nanovllm_full_run${i}.err
+done
 ```
