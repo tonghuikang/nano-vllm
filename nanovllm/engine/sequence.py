@@ -71,13 +71,72 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (
+            self.seq_id,
+            self.status,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            last_state,
+            self.max_tokens,
+            self.is_prefill,
+            self.temperature,
+            self.ignore_eos,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        sampling_params = SamplingParams()
+        if len(state) == 6:
+            self.seq_id = next(Sequence.counter)
+            self.status = SequenceStatus.WAITING
+            self.temperature = sampling_params.temperature
+            self.ignore_eos = sampling_params.ignore_eos
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_scheduled_tokens,
+                self.block_table,
+                last_state,
+            ) = state
+            self.max_tokens = sampling_params.max_tokens
+            saved_is_prefill = None
+        elif len(state) == 7:
+            self.seq_id = next(Sequence.counter)
+            self.status = SequenceStatus.WAITING
+            self.temperature = sampling_params.temperature
+            self.ignore_eos = sampling_params.ignore_eos
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_scheduled_tokens,
+                self.block_table,
+                last_state,
+                self.max_tokens,
+            ) = state
+            saved_is_prefill = None
+        else:
+            (
+                self.seq_id,
+                self.status,
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_scheduled_tokens,
+                self.block_table,
+                last_state,
+                self.max_tokens,
+                saved_is_prefill,
+                self.temperature,
+                self.ignore_eos,
+            ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
             self.token_ids = []
             self.last_token = last_state
+        self.is_prefill = isinstance(last_state, list) if saved_is_prefill is None else saved_is_prefill

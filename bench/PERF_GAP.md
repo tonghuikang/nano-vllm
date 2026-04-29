@@ -126,8 +126,17 @@ The fresh repeated vLLM L=4096/N=64 median on the same DGX Spark/Qwen3-0.6B
 setup is 2066.3 tok/s, so the target cell now measures 1.10x vLLM by median
 HTTP throughput.
 
-At very high concurrency (N ≥ 256) on the moderate-prefix row (L=4 k),
-nano-vllm is at ~0.4× of vLLM. Two likely causes:
+Additional single-run focused probes against the already-running nano-vLLM
+server on 2026-04-29 (`gpu_memory_utilization=0.85`,
+`max_num_batched_tokens=16384`, default varlen cascade):
+
+| prefix | N | output tok/s | vLLM reference | ratio | note |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4096 | 256 | 4482.5 | 4694 | 0.955x | clears target on this run; still needs median-of-3 confirmation |
+| 4096 | 1024 | 6345.9 | 8295 | 0.765x | still below target |
+
+At very high concurrency (N ≥ 1024) on the moderate-prefix row (L=4 k),
+nano-vllm is still short of vLLM. The likely cause:
 
 1. **Suffix kernel quality at N=1024.** The per-seq tails fan out to
    1024 unique block_tables. `flash_attn_varlen_func` with

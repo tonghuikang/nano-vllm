@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 import triton
@@ -5,6 +7,27 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+
+
+def _read_cascade_suffix_kernel() -> str:
+    kernel = os.environ.get("NANO_VLLM_CASCADE_SUFFIX_KERNEL", "varlen").strip().lower()
+    if kernel not in {"varlen", "kvcache", "flashinfer", "flashinfer_shared"}:
+        raise ValueError(
+            "NANO_VLLM_CASCADE_SUFFIX_KERNEL must be one of: varlen, kvcache, flashinfer, flashinfer_shared"
+        )
+    return kernel
+
+
+CASCADE_SUFFIX_KERNEL = _read_cascade_suffix_kernel()
+
+
+def _check_flashinfer_scale(q: torch.Tensor, scale: float):
+    default_scale = q.size(-1) ** -0.5
+    if abs(scale - default_scale) > 1e-12:
+        raise RuntimeError(
+            "FlashInfer cascade backends currently require the default "
+            "attention scale head_dim ** -0.5"
+        )
 
 
 @triton.jit
@@ -59,6 +82,15 @@ def _cascade_decode(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tenso
     """
     N = q.size(0)
 
+    if CASCADE_SUFFIX_KERNEL == "flashinfer":
+        _check_flashinfer_scale(q, scale)
+        return ctx.cascade_wrapper.run(q, (k_cache, v_cache))
+    if CASCADE_SUFFIX_KERNEL == "flashinfer_shared":
+        _check_flashinfer_scale(q, scale)
+        shared_k = k_cache.index_select(0, ctx.shared_prefix_blocks).flatten(0, 1)
+        shared_v = v_cache.index_select(0, ctx.shared_prefix_blocks).flatten(0, 1)
+        return ctx.cascade_wrapper.forward(q, shared_k, shared_v, (k_cache, v_cache))
+
     # Pass 1: prefix attention.
     out_p, lse_p, _ = flash_attn_varlen_func(
         q, k_cache, v_cache,
@@ -70,14 +102,23 @@ def _cascade_decode(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tenso
     )
 
     # Pass 2: suffix attention.
-    out_s, lse_s, _ = flash_attn_varlen_func(
-        q, k_cache, v_cache,
-        cu_seqlens_q=ctx.cu_q_suff, cu_seqlens_k=ctx.cu_k_suff,
-        max_seqlen_q=1, max_seqlen_k=ctx.tail_max_len,
-        softmax_scale=scale, causal=True,
-        block_table=ctx.tail_block_tables,
-        return_attn_probs=True,
-    )
+    if CASCADE_SUFFIX_KERNEL == "kvcache":
+        out_s, lse_s = flash_attn_with_kvcache(
+            q.unsqueeze(1), k_cache, v_cache,
+            cache_seqlens=ctx.tail_lens, block_table=ctx.tail_block_tables,
+            softmax_scale=scale, causal=True, return_softmax_lse=True,
+        )
+        out_s = out_s.squeeze(1)
+        lse_s = lse_s.squeeze(-1).transpose(0, 1)
+    else:
+        out_s, lse_s, _ = flash_attn_varlen_func(
+            q, k_cache, v_cache,
+            cu_seqlens_q=ctx.cu_q_suff, cu_seqlens_k=ctx.cu_k_suff,
+            max_seqlen_q=1, max_seqlen_k=ctx.tail_max_len,
+            softmax_scale=scale, causal=True,
+            block_table=ctx.tail_block_tables,
+            return_attn_probs=True,
+        )
 
     # Pass 3: merge. lse_p, lse_s shape [num_heads, N]; out_p, out_s [N, num_heads, head_dim].
     max_lse = torch.maximum(lse_p, lse_s)

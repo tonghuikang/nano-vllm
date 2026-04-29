@@ -55,6 +55,16 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _use_cached_block(self, block_id: int):
+        block = self.blocks[block_id]
+        if block_id in self.used_block_ids:
+            block.ref_count += 1
+        else:
+            assert block.ref_count == 0
+            block.ref_count = 1
+            self.free_block_ids.remove(block_id)
+            self.used_block_ids.add(block_id)
+
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
@@ -79,13 +89,7 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
-                self.free_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
+            self._use_cached_block(block_id)
             seq.block_table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
@@ -113,8 +117,20 @@ class BlockManager:
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            cached_block_id = self.hash_to_block_id.get(h, -1)
+            if cached_block_id != -1 and cached_block_id != block_id:
+                cached_block = self.blocks[cached_block_id]
+                if cached_block.token_ids == token_ids:
+                    self._use_cached_block(cached_block_id)
+                    block.ref_count -= 1
+                    assert block.ref_count >= 0
+                    seq.block_table[i] = cached_block_id
+                    if block.ref_count == 0:
+                        self._deallocate_block(block_id)
+                    continue
             block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            self.hash_to_block_id[h] = block_id
