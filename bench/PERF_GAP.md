@@ -1,11 +1,17 @@
-# Why nano-vllm trails vLLM on shared-prefix high-concurrency cells
+# How nano-vllm closed the shared-prefix high-concurrency gap
 
 Measured on **NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory)**, Qwen3-0.6B.
-See `bench_nanovllm.log` and `bench_vllm.log` for raw runs.
+See [`bench/FULL_SWEEP_20260429.md`](FULL_SWEEP_20260429.md),
+[`bench/bench_nanovllm.txt`](bench_nanovllm.txt), and
+[`bench/bench_vllm.txt`](bench_vllm.txt) for the current full-sweep results.
 
-The gap is concentrated on cells with **L ≥ 4 k AND N ≥ 16** — the L=1
-no-shared-prefix row stays at parity (within 5–10 % either way). That isolated
-the cause to nano-vllm's handling of long shared-prefix concurrent workloads.
+Current status: nothing remains behind vLLM at the parity tolerance. The fresh
+median-of-3 sweep has all 18 published cells at or above 0.95x vLLM, with the
+weakest cell at 0.978x (`prefix=1,N=1024`).
+
+Historically, the gap was concentrated on cells with **L ≥ 4 k AND N ≥ 16**,
+while the L=1 no-shared-prefix row stayed at parity. That isolated the cause to
+nano-vllm's handling of long shared-prefix concurrent workloads.
 
 ## What we found
 
@@ -71,10 +77,10 @@ Also landed:
   preempting on every step. At 0.85 the pool holds ~2,805 blocks and
   bs=1024 stays steady.
 
-### Bench impact
+### Historical bench impact
 
-L=1 row holds parity (cascade gate keeps it on the existing path).
-Shared-prefix cells (original cascade numbers at
+The L=1 row held parity (cascade gate kept it on the existing path).
+Shared-prefix cells below are the original cascade measurements at
 `gpu_memory_utilization=0.85`, which is enough for the ~2,063 blocks
 L=4 k N=1024 needs without preemption). The N=64 rows also include the
 fresh repeated HTTP medians after cascade CUDA graph capture:
@@ -138,8 +144,8 @@ nano-vLLM server on 2026-04-29 (`gpu_memory_utilization=0.85`,
 
 | prefix | N | output tok/s | vLLM reference | ratio | note |
 | ---: | ---: | ---: | ---: | ---: | --- |
-| 4096 | 256 | 4482.5 | 4694 | 0.955x | clears target on this run; still needs median-of-3 confirmation |
-| 4096 | 1024 | 6345.9 | 8295 | 0.765x | failed target before exact-block fix |
+| 4096 | 256 | 4482.5 | 4694 | 0.955x | pre-full-sweep focused probe |
+| 4096 | 1024 | 6345.9 | 8295 | 0.765x | pre exact-block fix |
 
 ### 2026-04-29 follow-up: exact-block full cache hits
 
@@ -171,8 +177,8 @@ Pre-fix medians from the same run directory (`nanovllm_varlen_run*.err`) were
 concentrated where the duplicated exact-block suffix was largest.
 
 At very high concurrency (N >= 1024) on the moderate-prefix row (L=4 k), the
-only residual watch item is full-sweep repeatability rather than a measured
-focused-cell gap. If a future full sweep regresses, the next likely limiter is:
+fresh full sweep now clears parity. If a future full sweep regresses, the next
+likely limiter to investigate is:
 
 1. **Suffix kernel quality at N=1024.** The per-seq tails fan out to
    1024 unique block_tables. `flash_attn_varlen_func` with
@@ -219,7 +225,7 @@ Nothing remaining at the parity tolerance.
   recompile_limit warnings but slightly regressed L=4 k N=4 (within
   noise). Reverted.
 
-The L=1 row already matching vLLM tells you nothing about the L=4 k or
-L=32 k gap — the L=1 path doesn't exercise the per-seq paged-attention
-read pattern that scales with prefix length. The cascade fix is what
-removed that scaling.
+The earlier L=1 row matching vLLM did not explain the historical L=4 k or
+L=32 k gap because the L=1 path does not exercise the per-seq paged-attention
+read pattern that scales with prefix length. The cascade fix removed that
+scaling.
